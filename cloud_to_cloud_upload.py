@@ -53,7 +53,7 @@ def detect_source(url: str, requested_kind: str = "") -> str:
         or host == "drive.usercontent.google.com"
     ):
         return "gdrive"
-    if host == "skydrop.sbs" or host.endswith(".skydrop.sbs"):
+    if host == "skydrop.sbs" or host.endswith(".skydrop.sbs") or host == "drop1.vegadrive.top":
         return "skydrop"
     if any(item in host for item in ("googleusercontent.com", "ggpht.com", "photos.google.com", "vidfiles.com")):
         return "gphotos"
