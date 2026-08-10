@@ -31,6 +31,12 @@ MEDIA_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".zip", ".rar", ".7
 PIXELDRAIN_LIMIT_BYTES = 10_000_000_000
 VIKINGFILE_API_ORIGIN = "https://vikingfile.com"
 
+# The local dispatcher labels files that use the one-click Drive relay with
+# these names.  They are still staged generic HTTP downloads here, but they
+# must receive the same mirror fan-out as the legacy ``zip`` job names.
+PIXELDRAIN_SOURCE_KINDS = {"zip", "one-click-zip", "skydrop"}
+VIKINGFILE_SOURCE_KINDS = {"zip", "zip-large", "one-click-zip", "one-click-zip-large"}
+
 
 @dataclass(frozen=True)
 class ResolvedSource:
@@ -645,9 +651,9 @@ def main() -> int:
             pixel_keys = []
         pixel_keys = [str(value).strip() for value in pixel_keys if str(value).strip()]
         viking_hash = os.environ.get("CLOUD_VIKINGFILE_USER_HASH", "").strip()
-        if requested_kind in {"zip", "skydrop"} and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
+        if requested_kind in PIXELDRAIN_SOURCE_KINDS and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
             provider_tasks["pixeldrain_url"] = lambda: upload_to_pixeldrain(local_path, pixel_keys)
-        if requested_kind in {"zip", "zip-large"} and viking_hash:
+        if requested_kind in VIKINGFILE_SOURCE_KINDS and viking_hash:
             provider_tasks["vikingfile_url"] = lambda: upload_to_vikingfile(
                 local_path, viking_hash, args.upload_workers
             )
