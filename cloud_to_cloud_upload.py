@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ DEFAULT_CLEANUP_ABOVE_GIB = 8.0
 DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 MEDIA_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".zip", ".rar", ".7z")
 PIXELDRAIN_LIMIT_BYTES = 10_000_000_000
+PIXELDRAIN_UPLOAD_API = "https://pixeldrain.com/api/file"
 VIKINGFILE_API_ORIGIN = "https://vikingfile.com"
 
 # The local dispatcher labels files that use the one-click Drive relay with
@@ -45,6 +47,41 @@ class ResolvedSource:
     filename: str
     size_bytes: int
     kind: str
+
+
+@dataclass(frozen=True)
+class LivePixelDrainOutcome:
+    """The PixelDrain result from a live source-to-staging-file stream."""
+
+    url: str | None
+    error: str = ""
+
+
+@dataclass
+class LivePixelDrainStream:
+    """A live PixelDrain request which tails a verified staged source file."""
+
+    output_path: Path
+    api_keys: list[str]
+    uploader: threading.Thread
+    state: dict[str, Any]
+
+    def finish(self) -> LivePixelDrainOutcome:
+        """Wait for the live request, then retry once from the staged file."""
+        self.uploader.join(timeout=1860)
+        if self.uploader.is_alive():
+            return LivePixelDrainOutcome(None, "Live PixelDrain upload timed out after staging completed.")
+        live_url = str(self.state["pixel_url"] or "").strip()
+        if live_url:
+            return LivePixelDrainOutcome(live_url)
+        live_error = str(self.state["pixel_error"] or "Live PixelDrain upload failed.")
+        try:
+            return LivePixelDrainOutcome(upload_to_pixeldrain(self.output_path, self.api_keys))
+        except Exception as exc:  # noqa: BLE001 - TransferIt can still complete independently.
+            return LivePixelDrainOutcome(
+                None,
+                f"Live upload failed ({live_error}); staged retry failed: {type(exc).__name__}: {exc}"[:300],
+            )
 
 
 def detect_source(url: str, requested_kind: str = "") -> str:
@@ -461,7 +498,7 @@ def upload_to_pixeldrain(local_path: Path, api_keys: list[str]) -> str:
                 timeout=httpx.Timeout(connect=60.0, read=1800.0, write=1800.0, pool=60.0)
             ) as client:
                 response = client.put(
-                    f"https://pixeldrain.com/api/file/{quote(local_path.name, safe='')}",
+                    f"{PIXELDRAIN_UPLOAD_API}/{quote(local_path.name, safe='')}",
                     auth=("", api_key),
                     content=source,
                     headers={
@@ -478,6 +515,138 @@ def upload_to_pixeldrain(local_path: Path, api_keys: list[str]) -> str:
         except Exception as exc:  # noqa: BLE001 - try the next private account.
             last_error = f"{type(exc).__name__}: {exc}"
     raise RuntimeError(last_error[:300])
+
+
+def download_http_source_with_live_pixeldrain(
+    source: ResolvedSource,
+    output_path: Path,
+    api_keys: list[str],
+) -> LivePixelDrainStream:
+    """Stage an HTTP source while a PixelDrain request tails the same file.
+
+    The source download always owns the durable staging file. PixelDrain reads
+    only flushed byte ranges and can be retried from the completed file if its
+    live request is interrupted, so this overlap never trades away recovery.
+    """
+    expected = source.size_bytes
+    if expected <= 0:
+        raise ValueError("Live PixelDrain streaming requires a verified source size.")
+    if not api_keys:
+        raise ValueError("Live PixelDrain streaming requires an API key.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb"):
+        pass
+
+    state: dict[str, Any] = {
+        "written": 0,
+        "download_done": False,
+        "download_error": "",
+        "pixel_url": "",
+        "pixel_error": "",
+    }
+    available = threading.Condition()
+
+    def pixel_body() -> Any:
+        offset = 0
+        with output_path.open("rb") as staged:
+            while offset < expected:
+                with available:
+                    while (
+                        int(state["written"]) <= offset
+                        and not bool(state["download_done"])
+                    ):
+                        available.wait(timeout=1.0)
+                    download_error = str(state["download_error"] or "")
+                    written = int(state["written"])
+                    finished = bool(state["download_done"])
+                if download_error:
+                    raise RuntimeError(f"Source download failed: {download_error}")
+                if written <= offset:
+                    if finished:
+                        raise RuntimeError("Source download ended before all expected bytes were staged.")
+                    continue
+                length = min(1024 * 1024, written - offset)
+                staged.seek(offset)
+                chunk = staged.read(length)
+                if len(chunk) != length:
+                    # The writer only publishes flushed bytes. A short read is
+                    # therefore transient filesystem visibility, not data loss.
+                    time.sleep(0.02)
+                    continue
+                offset += len(chunk)
+                yield chunk
+        if offset != expected:
+            raise RuntimeError("PixelDrain stream did not receive every source byte.")
+
+    def upload_live() -> None:
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(connect=60.0, read=1800.0, write=300.0, pool=60.0)
+            ) as client:
+                response = client.put(
+                    f"{PIXELDRAIN_UPLOAD_API}/{quote(output_path.name, safe='')}",
+                    auth=("", api_keys[0]),
+                    content=pixel_body(),
+                    headers={
+                        "Content-Length": str(expected),
+                        "Content-Type": "application/octet-stream",
+                        "Accept": "application/json",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if response.is_success and isinstance(payload, dict) and payload.get("id"):
+                state["pixel_url"] = f"https://pixeldrain.com/u/{payload['id']}"
+            else:
+                message = payload.get("message") or payload.get("value") if isinstance(payload, dict) else ""
+                state["pixel_error"] = str(message or f"HTTP {response.status_code}")[:300]
+        except Exception as exc:  # noqa: BLE001 - retry only after staging completes.
+            state["pixel_error"] = f"{type(exc).__name__}: {exc}"[:300]
+
+    uploader = threading.Thread(target=upload_live, name="pixeldrain-live-upload", daemon=True)
+    uploader.start()
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=60.0, read=300.0, write=60.0, pool=60.0),
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+        ) as client:
+            with client.stream("GET", source.direct_url) as response:
+                response.raise_for_status()
+                if is_html(response.headers.get("Content-Type", "")):
+                    raise ValueError("Source returned HTML instead of the requested file.")
+                response_total = response_size(response.headers)
+                if response_total and response_total != expected:
+                    raise ValueError(
+                        f"Source size changed from {expected} to {response_total} bytes before streaming."
+                    )
+                with output_path.open("wb") as output:
+                    for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        output.write(chunk)
+                        output.flush()
+                        with available:
+                            state["written"] = int(state["written"]) + len(chunk)
+                            available.notify_all()
+        if int(state["written"]) != expected:
+            raise ValueError(f"Stored {state['written']} bytes; expected {expected}.")
+    except Exception as exc:
+        with available:
+            state["download_error"] = f"{type(exc).__name__}: {exc}"
+            state["download_done"] = True
+            available.notify_all()
+        uploader.join(timeout=310)
+        raise
+    else:
+        with available:
+            state["download_done"] = True
+            available.notify_all()
+    return LivePixelDrainStream(output_path, api_keys, uploader, state)
 
 
 def upload_to_vikingfile(local_path: Path, user_hash: str, upload_workers: int) -> str:
@@ -632,8 +801,28 @@ def main() -> int:
 
         temp_dir = Path(tempfile.mkdtemp(prefix="cloud-upload-"))
         local_path = temp_dir / Path(source.filename).name
+        try:
+            pixel_keys = json.loads(os.environ.get("CLOUD_PIXELDRAIN_KEYS_JSON", "[]"))
+        except json.JSONDecodeError:
+            pixel_keys = []
+        pixel_keys = [str(value).strip() for value in pixel_keys if str(value).strip()]
+        live_pixel_enabled = (
+            requested_kind in PIXELDRAIN_SOURCE_KINDS
+            and bool(pixel_keys)
+            and 0 < source.size_bytes <= PIXELDRAIN_LIMIT_BYTES
+            and source.kind != "gdrive"
+        )
+        live_pixel_stream: LivePixelDrainStream | None = None
         download_started = time.monotonic()
-        if source.kind == "gdrive":
+        if live_pixel_enabled:
+            print("Staging source while PixelDrain starts its live upload.")
+            try:
+                live_pixel_stream = download_http_source_with_live_pixeldrain(source, local_path, pixel_keys)
+            except Exception as exc:  # noqa: BLE001 - retain the established staged downloader as a fallback.
+                print(f"Live PixelDrain path unavailable ({type(exc).__name__}); using the staged downloader.")
+                local_path.unlink(missing_ok=True)
+                download_http_source(source, local_path, args.download_workers)
+        elif source.kind == "gdrive":
             download_gdrive(source_url, local_path, args.download_workers)
         else:
             download_http_source(source, local_path, args.download_workers)
@@ -642,24 +831,19 @@ def main() -> int:
             f"Download finished in {time.monotonic() - download_started:.0f}s "
             f"({size_bytes / (1024 ** 2) / max(time.monotonic() - download_started, 0.001):.1f} MiB/s)."
         )
+        provider_urls: dict[str, str] = {}
+        provider_errors: dict[str, str] = {}
         provider_tasks: dict[str, Any] = {
             "transfer_url": lambda: upload_to_destination(local_path, args.upload_workers),
         }
-        try:
-            pixel_keys = json.loads(os.environ.get("CLOUD_PIXELDRAIN_KEYS_JSON", "[]"))
-        except json.JSONDecodeError:
-            pixel_keys = []
-        pixel_keys = [str(value).strip() for value in pixel_keys if str(value).strip()]
         viking_hash = os.environ.get("CLOUD_VIKINGFILE_USER_HASH", "").strip()
-        if requested_kind in PIXELDRAIN_SOURCE_KINDS and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
+        if not live_pixel_stream and requested_kind in PIXELDRAIN_SOURCE_KINDS and pixel_keys and size_bytes <= PIXELDRAIN_LIMIT_BYTES:
             provider_tasks["pixeldrain_url"] = lambda: upload_to_pixeldrain(local_path, pixel_keys)
         if requested_kind in VIKINGFILE_SOURCE_KINDS and viking_hash:
             provider_tasks["vikingfile_url"] = lambda: upload_to_vikingfile(
                 local_path, viking_hash, args.upload_workers
             )
 
-        provider_urls: dict[str, str] = {}
-        provider_errors: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=len(provider_tasks)) as executor:
             futures = {executor.submit(task): name for name, task in provider_tasks.items()}
             for future in as_completed(futures):
@@ -668,6 +852,12 @@ def main() -> int:
                     provider_urls[name] = future.result()
                 except Exception as exc:  # noqa: BLE001 - preserve successful mirrors.
                     provider_errors[name.removesuffix("_url")] = f"{type(exc).__name__}: {exc}"[:300]
+        if live_pixel_stream is not None:
+            live_pixel = live_pixel_stream.finish()
+            if live_pixel.url:
+                provider_urls["pixeldrain_url"] = live_pixel.url
+            else:
+                provider_errors["pixeldrain"] = live_pixel.error or "Live PixelDrain upload failed."
         elapsed = time.monotonic() - started_at
         result.update(
             {
