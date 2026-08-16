@@ -32,6 +32,8 @@ MEDIA_EXTENSIONS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".zip", ".rar", ".7
 PIXELDRAIN_LIMIT_BYTES = 10_000_000_000
 PIXELDRAIN_UPLOAD_API = "https://pixeldrain.com/api/file"
 VIKINGFILE_API_ORIGIN = "https://vikingfile.com"
+SKYDROP_BYPASS_HEADER = "X-Vega-Worker-Key"
+SKYDROP_ORIGIN_HOSTS = {"drop1.vegadrive.top"}
 
 # The local dispatcher labels files that use the one-click Drive relay with
 # these names.  They are still staged generic HTTP downloads here, but they
@@ -170,6 +172,81 @@ def response_size(headers: httpx.Headers) -> int:
         return int(headers.get("Content-Length", "0"))
     except ValueError:
         return 0
+
+
+def resolve_skydrop_origin_redirect(url: str) -> str:
+    """Resolve the protected SkyDrop hops without leaking the private header."""
+    secret = os.environ.get("CLOUD_SKYDROP_BYPASS_SECRET", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,200}", secret):
+        raise ValueError("SkyDrop bypass credential is unavailable in this runner.")
+
+    current_url = url
+    timeout = httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0)
+    with httpx.Client(follow_redirects=False, timeout=timeout) as client:
+        for _ in range(6):
+            parsed = urlparse(current_url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if parsed.scheme != "https" or host not in SKYDROP_ORIGIN_HOSTS:
+                return current_url
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+                "Range": "bytes=0-0",
+                "User-Agent": USER_AGENT,
+                SKYDROP_BYPASS_HEADER: secret,
+            }
+            with client.stream("GET", current_url, headers=headers) as response:
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    response.raise_for_status()
+                    raise ValueError("SkyDrop origin returned bytes instead of a protected media redirect.")
+                location = response.headers.get("Location", "").strip()
+            if not location:
+                raise ValueError("SkyDrop returned a redirect without a Location header.")
+            next_url = urljoin(current_url, location)
+            next_parsed = urlparse(next_url)
+            if next_parsed.scheme != "https" or not next_parsed.hostname:
+                raise ValueError("SkyDrop returned an unsafe media redirect.")
+            current_url = next_url
+    raise ValueError("SkyDrop returned too many protected redirects.")
+
+
+def inspect_skydrop_source(url: str, requested_filename: str) -> ResolvedSource:
+    """Resolve SkyDrop to Google media, verify one byte, and retain its size."""
+    direct_url = resolve_skydrop_origin_redirect(url)
+    host = (urlparse(direct_url).hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "googleusercontent.com"
+        or host.endswith(".googleusercontent.com")
+        or host == "usercontent.google.com"
+        or host.endswith(".usercontent.google.com")
+        or host == "google.com"
+        or host.endswith(".google.com")
+    )
+    if not allowed:
+        raise ValueError("SkyDrop did not resolve to an approved Google media host.")
+
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Range": "bytes=0-0",
+        "User-Agent": USER_AGENT,
+    }
+    timeout = httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0)
+    with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+        with client.stream("GET", direct_url, headers=headers) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            if is_html(content_type):
+                raise ValueError("SkyDrop resolved to HTML instead of media bytes.")
+            verified_url = str(response.url)
+            size_bytes = response_size(response.headers)
+    return ResolvedSource(
+        original_url=url,
+        direct_url=verified_url,
+        filename=Path(requested_filename).name if requested_filename.strip() else "skydrop_download.bin",
+        size_bytes=size_bytes,
+        kind="skydrop",
+    )
 
 
 def drive_file_id_from_url(url: str) -> str:
@@ -318,14 +395,7 @@ def inspect_http_source(url: str, requested_filename: str, kind: str) -> Resolve
     # Following it during the metadata probe can redirect a healthy source to a
     # short-lived api.php URL before aria2c gets the original request.
     if kind == "skydrop":
-        filename = Path(requested_filename).name if requested_filename.strip() else "skydrop_download.bin"
-        return ResolvedSource(
-            original_url=url,
-            direct_url=url,
-            filename=filename,
-            size_bytes=0,
-            kind=kind,
-        )
+        return inspect_skydrop_source(url, requested_filename)
     headers = {"User-Agent": USER_AGENT}
     direct_url = url
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0), headers=headers) as client:

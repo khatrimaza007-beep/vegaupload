@@ -75,8 +75,11 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
     filename = str(job.get("filename") or "")
     pixel_keys = [str(value).strip() for value in job.get("pixeldrain_api_keys", []) if str(value).strip()]
     viking_hash = str(job.get("vikingfile_user_hash") or "").strip()
+    skydrop_bypass_secret = str(job.get("skydrop_bypass_secret") or "").strip()
     if not source_url or not source_kind or not filename:
         raise RuntimeError("Broker job is incomplete.")
+    if source_kind == "skydrop" and len(skydrop_bypass_secret) < 20:
+        raise RuntimeError("Broker job has no valid SkyDrop bypass credential.")
 
     add_mask(source_url)
     add_mask(filename)
@@ -86,9 +89,11 @@ def run_transfer(job: dict[str, object]) -> dict[str, object]:
     env["CLOUD_SOURCE_FILENAME"] = filename
     env["CLOUD_PIXELDRAIN_KEYS_JSON"] = json.dumps(pixel_keys)
     env["CLOUD_VIKINGFILE_USER_HASH"] = viking_hash
+    env["CLOUD_SKYDROP_BYPASS_SECRET"] = skydrop_bypass_secret
     for value in pixel_keys:
         add_mask(value)
     add_mask(viking_hash)
+    add_mask(skydrop_bypass_secret)
 
     with tempfile.TemporaryDirectory(prefix="broker-cloud-") as temporary_dir:
         directory = Path(temporary_dir)
