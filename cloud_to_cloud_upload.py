@@ -38,7 +38,7 @@ SKYDROP_ORIGIN_HOSTS = {"drop1.vegadrive.top"}
 # The local dispatcher labels files that use the one-click Drive relay with
 # these names.  They are still staged generic HTTP downloads here, but they
 # must receive the same mirror fan-out as the legacy ``zip`` job names.
-PIXELDRAIN_SOURCE_KINDS = {"zip", "one-click-zip", "skydrop"}
+PIXELDRAIN_SOURCE_KINDS = {"zip", "one-click-zip", "skydrop", "gdrive"}
 VIKINGFILE_SOURCE_KINDS = {"zip", "zip-large", "one-click-zip", "one-click-zip-large"}
 
 
